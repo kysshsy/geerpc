@@ -3,8 +3,10 @@ package geerpc
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"geerpc/codec"
 	"io"
+	"log"
 	"net"
 	"sync"
 )
@@ -74,7 +76,7 @@ func parseOption(option []*Option) (*Option, error) {
 type Call struct {
 	ServiceMethod string
 	Seq           uint64
-	Err           string
+	Err           error
 	Args          interface{}
 	Replys        interface{}
 	Done          chan *Call
@@ -100,6 +102,49 @@ var _ io.Closer = (*Client)(nil)
 
 var ErrShutdown = errors.New("connection is shut down")
 
+func (c *Client) Go(serviceMethod string, args, replys interface{}, done chan *Call) *Call {
+	if done == nil {
+		done = make(chan *Call, 10)
+	} else if cap(done) == 0 {
+		log.Panic("rpc client: done doesn't buffered")
+	}
+
+	call := &Call{
+		ServiceMethod: serviceMethod,
+		Args:          args,
+		Replys:        replys,
+		Done:          done,
+	}
+	go c.send(call)
+
+	return call
+}
+func (c *Client) Call(serviceMethod string, args, replys interface{}) error {
+	call := <-c.Go(serviceMethod, args, replys, nil).Done
+
+	return call.Err
+}
+
+func (c *Client) send(call *Call) {
+	c.sending.Lock()
+	defer c.sending.Unlock()
+
+	seq, err := c.registerCall(call)
+	if err != nil {
+		call.Err = err
+		call.done()
+	}
+
+	c.header.ServiceMethod = call.ServiceMethod
+	c.header.Seq = seq
+	c.header.Error = ""
+
+	if err := c.cc.Write(&c.header, call.Args); err != nil {
+		call := c.removeCall(c.header.Seq)
+		call.Err = err
+		call.done()
+	}
+}
 func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -154,7 +199,7 @@ func (c *Client) terminateCall(err error) {
 	c.shutdown = true
 
 	for k, v := range c.pending {
-		v.Err = err.Error()
+		v.Err = err
 		//Q：map 删除会不会破坏range的顺序 A: it's safe
 		delete(c.pending, k)
 		v.done()
@@ -172,7 +217,20 @@ func (c *Client) receive() {
 
 		switch {
 		case call == nil:
-			err = c.
+			err = c.cc.ReadBody(nil)
+		case header.Error != "":
+			call.Err = fmt.Errorf(header.Error)
+			err = c.cc.ReadBody(nil)
+			call.done()
+		default:
+			err = c.cc.ReadBody(call.Replys)
+			if err != nil {
+				err = c.cc.ReadBody(call.Replys) // 这是啥情况
+				if err != nil {
+					call.Err = errors.New("read body" + err.Error())
+				}
+				call.done()
+			}
 		}
 	}
 	c.terminateCall(err)
