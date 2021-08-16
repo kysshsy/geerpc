@@ -49,12 +49,12 @@ func (cc *JsonCodec) Write(h *Header, b interface{}) (err error) {
 
 	if err := cc.enc.Encode(h); err != nil {
 		log.Println("rpc codec: gob Write Header fail")
-		return
+		return err
 	}
 
 	if err := cc.enc.Encode(b); err != nil {
 		log.Println("rpc codec: gob Write Body fail")
-		return
+		return err
 	}
-	return
+	return err
 }
