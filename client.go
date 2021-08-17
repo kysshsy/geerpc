@@ -225,12 +225,9 @@ func (c *Client) receive() {
 		default:
 			err = c.cc.ReadBody(call.Replys)
 			if err != nil {
-				err = c.cc.ReadBody(call.Replys) // 这是啥情况
-				if err != nil {
-					call.Err = errors.New("read body" + err.Error())
-				}
-				call.done()
+				call.Err = errors.New("read body" + err.Error())
 			}
+			call.done()
 		}
 	}
 	c.terminateCall(err)
