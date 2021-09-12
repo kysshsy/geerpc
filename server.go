@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"geerpc/codec"
+	"go/token"
 	"io"
 	"log"
 	"net"
 	"reflect"
 	"sync"
+	"sync/atomic"
 )
 
 const MagicNumber = 0x3bef5c
@@ -102,8 +104,8 @@ func (s *Server) serveConn(cc codec.Codec) {
 func (s *Server) handleRequest(cc codec.Codec, req *Request, sending *sync.Mutex, wg *sync.WaitGroup) {
 	defer wg.Done()
 	log.Println(req.h, req.argv.Elem())
-	req.repv = reflect.ValueOf(fmt.Sprintf("geerpc resp %d", req.h.Seq))
-	s.sendResponse(cc, req.h, req.repv.Interface(), sending)
+	req.replyv = reflect.ValueOf(fmt.Sprintf("geerpc resp %d", req.h.Seq))
+	s.sendResponse(cc, req.h, req.replyv.Interface(), sending)
 
 }
 
@@ -116,8 +118,8 @@ func (s *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{},
 }
 
 type Request struct {
-	h          *codec.Header
-	argv, repv reflect.Value
+	h            *codec.Header
+	argv, replyv reflect.Value
 }
 
 func (s *Server) readRequestHeader(cc codec.Codec) (*codec.Header, error) {
@@ -144,4 +146,114 @@ func (s *Server) readRequest(cc codec.Codec) (*Request, error) {
 	}
 
 	return req, err
+}
+
+type methodType struct {
+	method    reflect.Method
+	argvType  reflect.Type
+	replyType reflect.Type
+	numCalls  uint64
+}
+
+func (m *methodType) NumCalls() uint64 {
+	return atomic.LoadUint64(&m.numCalls)
+}
+
+func (m *methodType) newArgv() reflect.Value {
+	var argv reflect.Value
+
+	if m.argvType.Kind() == reflect.Ptr {
+		argv = reflect.New(m.argvType.Elem())
+	} else {
+		argv = reflect.New(m.argvType).Elem()
+	}
+
+	return argv
+}
+
+func (m *methodType) newReplyv() reflect.Value {
+
+	replyv := reflect.New(m.replyType.Elem())
+
+	switch m.replyType.Elem().Kind() {
+	case reflect.Map:
+		replyv.Elem().Set(reflect.MakeMap(m.replyType.Elem()))
+	case reflect.Slice:
+		replyv.Elem().Set(reflect.MakeSlice(m.replyType.Elem(), 0, 0))
+	}
+	return replyv
+}
+
+type service struct {
+	name    string
+	typ     reflect.Type
+	rcvr    reflect.Value
+	methods map[string]*methodType
+}
+
+func newService(rcvr interface{}) *service {
+	s := new(service)
+
+	s.typ = reflect.TypeOf(rcvr)
+	s.rcvr = reflect.ValueOf(rcvr)
+
+	s.name = reflect.Indirect(s.rcvr).Type().Name()
+
+	if !token.IsExported(s.name) {
+		log.Fatalf("struct :%s is not a exported type\n", s.name)
+	}
+
+	s.registerMethods()
+
+	return s
+}
+
+func (s *service) registerMethods() {
+	s.methods = make(map[string]*methodType)
+
+	for i := 0; i < s.typ.NumMethod(); i++ {
+		method := s.typ.Method(i)
+		mType := method.Type
+
+		if !method.IsExported() {
+			continue
+		}
+		if mType.NumIn() != 3 || mType.NumOut() != 1 {
+			continue
+		}
+		argType, replyType := mType.In(1), mType.In(2)
+		if !isExportedOrBuiltinType(argType) || !isExportedOrBuiltinType(replyType) {
+			continue
+		}
+		if mType.Out(0) != reflect.TypeOf((*error)(nil)).Elem() {
+			continue
+		}
+
+		s.methods[method.Name] = &methodType{
+			method:    method,
+			argvType:  argType,
+			replyType: replyType,
+		}
+
+		log.Printf("service %s register method: %s", s.name, method.Name)
+
+	}
+}
+
+func isExportedOrBuiltinType(t reflect.Type) bool {
+	for t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	return token.IsExported(t.Name()) || t.PkgPath() == ""
+}
+
+func (s *service) call(m *methodType, argv, replyv reflect.Value) error {
+	atomic.AddUint64(&m.numCalls, 1)
+	f := m.method.Func
+
+	returnValues := f.Call([]reflect.Value{s.rcvr, argv, replyv})
+	if errInter := returnValues[0].Interface(); errInter != nil {
+		return errInter.(error)
+	}
+	return nil
 }

@@ -28,7 +28,7 @@ var CodecFuncMap map[Type]NewCodecFunc
 
 func init() {
 	CodecFuncMap = make(map[Type]NewCodecFunc)
-	// TODO: 增加 gob json的func
-	CodecFuncMap[GobType] = NewGobCodec
 
+	CodecFuncMap[GobType] = NewGobCodec
+	CodecFuncMap[JsonType] = NewJsonCodec
 }
