@@ -2,13 +2,14 @@ package geerpc
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
 	"geerpc/codec"
 	"go/token"
 	"io"
 	"log"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -25,7 +26,31 @@ var DefaultOption = &Option{
 	CodecType:   codec.GobType,
 }
 
-type Server struct{}
+type Server struct {
+	ServiceMap sync.Map
+}
+
+type Request struct {
+	h            *codec.Header
+	argv, replyv reflect.Value
+
+	service *service
+	method  *methodType
+}
+
+type service struct {
+	name    string
+	typ     reflect.Type
+	rcvr    reflect.Value
+	methods map[string]*methodType
+}
+
+type methodType struct {
+	method    reflect.Method
+	argvType  reflect.Type
+	replyType reflect.Type
+	numCalls  uint64
+}
 
 func NewServer() *Server {
 	return &Server{}
@@ -46,9 +71,6 @@ func (s *Server) Accept(lis net.Listener) {
 func Accept(lis net.Listener) { DefaultServer.Accept(lis) }
 
 func (s *Server) ServeConn(conn io.ReadWriteCloser) {
-	defer func() {
-		_ = conn.Close()
-	}()
 
 	dec := json.NewDecoder(conn)
 
@@ -98,13 +120,16 @@ func (s *Server) serveConn(cc codec.Codec) {
 	}
 
 	wg.Wait()
-
+	cc.Close()
 }
 
 func (s *Server) handleRequest(cc codec.Codec, req *Request, sending *sync.Mutex, wg *sync.WaitGroup) {
 	defer wg.Done()
-	log.Println(req.h, req.argv.Elem())
-	req.replyv = reflect.ValueOf(fmt.Sprintf("geerpc resp %d", req.h.Seq))
+
+	err := req.service.call(req.method, req.argv, req.replyv)
+	if err != nil {
+		req.h.Error = err.Error()
+	}
 	s.sendResponse(cc, req.h, req.replyv.Interface(), sending)
 
 }
@@ -115,11 +140,6 @@ func (s *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{},
 	if err := cc.Write(h, body); err != nil {
 		log.Println("rpc server: write response error:", err)
 	}
-}
-
-type Request struct {
-	h            *codec.Header
-	argv, replyv reflect.Value
 }
 
 func (s *Server) readRequestHeader(cc codec.Codec) (*codec.Header, error) {
@@ -140,19 +160,47 @@ func (s *Server) readRequest(cc codec.Codec) (*Request, error) {
 
 	req := &Request{h: h}
 
-	req.argv = reflect.New(reflect.TypeOf(""))
-	if err := cc.ReadBody(req.argv.Interface()); err != nil {
-		log.Printf("rpc server: read argv error: %s\n", err.Error())
+	err = s.findServiceAndMethod(req)
+	if err != nil {
+		return req, err
+	}
+
+	m := req.method
+	req.argv = m.newArgv()
+	req.replyv = m.newReplyv()
+
+	if req.argv.Kind() == reflect.Ptr {
+		err = cc.ReadBody(req.argv.Interface())
+	} else {
+		err = cc.ReadBody(req.argv.Addr().Interface())
 	}
 
 	return req, err
+
 }
 
-type methodType struct {
-	method    reflect.Method
-	argvType  reflect.Type
-	replyType reflect.Type
-	numCalls  uint64
+func (s *Server) findServiceAndMethod(req *Request) error {
+	dot := strings.LastIndex(req.h.ServiceMethod, ".")
+	if dot < 0 {
+		return errors.New("rpc: service/method request ill-formed: " + req.h.ServiceMethod)
+	}
+
+	serviceName := req.h.ServiceMethod[:dot]
+	methodName := req.h.ServiceMethod[dot+1:]
+
+	svci, ok := s.ServiceMap.Load(serviceName)
+	if !ok {
+		return errors.New("rpc: can't find service " + serviceName)
+	}
+	svc := svci.(*service)
+	method, ok := svc.methods[methodName]
+	if !ok {
+		return errors.New("rpc: can't find method " + methodName)
+	}
+
+	req.service = svc
+	req.method = method
+	return nil
 }
 
 func (m *methodType) NumCalls() uint64 {
@@ -182,13 +230,6 @@ func (m *methodType) newReplyv() reflect.Value {
 		replyv.Elem().Set(reflect.MakeSlice(m.replyType.Elem(), 0, 0))
 	}
 	return replyv
-}
-
-type service struct {
-	name    string
-	typ     reflect.Type
-	rcvr    reflect.Value
-	methods map[string]*methodType
 }
 
 func newService(rcvr interface{}) *service {
@@ -256,4 +297,19 @@ func (s *service) call(m *methodType, argv, replyv reflect.Value) error {
 		return errInter.(error)
 	}
 	return nil
+}
+
+func (s *Server) Register(rcvr interface{}) error {
+
+	service := newService(rcvr)
+
+	if _, dup := s.ServiceMap.LoadOrStore(service.name, service); dup {
+		return errors.New("rpc. Register: service already register: " + service.name)
+	}
+
+	return nil
+}
+
+func Register(rcvr interface{}) error {
+	return DefaultServer.Register(rcvr)
 }
