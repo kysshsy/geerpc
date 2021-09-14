@@ -11,7 +11,7 @@ import (
 	"sync"
 )
 
-func Dail(network, addr string, option ...*Option) (client *Client, err error) {
+func Dial(network, addr string, option ...*Option) (client *Client, err error) {
 	opt, err := parseOption(option)
 	if err != nil {
 		return nil, err
